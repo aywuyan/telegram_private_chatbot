@@ -38,9 +38,6 @@ Manual deploy users: copy the updated `worker.js`, redeploy, and add the new env
 
 ---
 
-<details>
-<summary>📢 <b>v5.1 Update (2026-01-05)</b></summary>
-
 ## 📑 Table of Contents
 
 * [✨ Key Features](#-key-features)
