@@ -1,4 +1,4 @@
-// Cloudflare Worker：Telegram 双向机器人 v5.3
+// Cloudflare Worker：Telegram 双向机器人 v5.4
 
 // --- 配置常量 ---
 const CONFIG = {
@@ -21,7 +21,13 @@ const CONFIG = {
     MAX_CLEANUP_DISPLAY: 20,
     CLEANUP_LOCK_TTL_SECONDS: 1800,     // /cleanup 防并发锁 30 分钟
     MAX_RETRY_ATTEMPTS: 3,
-    THREAD_HEALTH_TTL_MS: 60000
+    THREAD_HEALTH_TTL_MS: 60000,
+    TURNSTILE_VERIFY_TTL: 600,            // Turnstile 验证 code 有效期 10 分钟
+    NEW_USER_LINK_BLOCK_SECONDS: 86400,   // 新用户 24 小时内禁止发链接
+    SPAM_MESSAGE_HASH_TTL: 3600,          // 消息去重 hash 缓存 1 小时
+    SPAM_REPEAT_MESSAGE_LIMIT: 3,         // 相同内容重复次数阈值
+    SPAM_NOTIFY_ADMIN: true,              // 是否通知管理员有骚扰消息
+    SPAM_SILENCE_MODE: false              // 静默丢弃模式（不通知管理员）
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -30,6 +36,10 @@ const threadHealthCache = new Map();
 const topicCreateInFlight = new Map();
 // 管理员权限缓存（实例内）
 const adminStatusCache = new Map();
+// 垃圾关键词集合（延迟初始化）
+let spamKeywordsCache = null;
+// 消息哈希去重缓存（用于检测重复骚扰消息）
+const messageHashCache = new Map();
 
 // --- 本地题库 (15条) ---
 const LOCAL_QUESTIONS = [
@@ -370,6 +380,327 @@ async function checkRateLimit(userId, env, action = 'message', limit = 20, windo
     return { allowed: true, remaining: limit - count - 1 };
 }
 
+// --- Turnstile 人机验证模块 ---
+
+/**
+ * 调用 Cloudflare Turnstile API 验证 token
+ * @param {string} token - Turnstile 前端生成的 token
+ * @param {string} secretKey - Turnstile secret key
+ * @param {string} remoteIp - 用户 IP（可选）
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+async function verifyTurnstileToken(token, secretKey, remoteIp) {
+    const formData = new URLSearchParams();
+    formData.append('secret', secretKey);
+    formData.append('response', token);
+    if (remoteIp) {
+        formData.append('remoteip', remoteIp);
+    }
+
+    try {
+        const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: formData.toString()
+        });
+        const result = await resp.json();
+        return { success: result.success === true, error: result['error-codes']?.join(', ') };
+    } catch (e) {
+        Logger.error('turnstile_verify_error', e);
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * 生成安全的验证 code（用于 Turnstile 回调）
+ * @returns {string} 随机验证码
+ */
+function generateVerifyCode() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// --- 垃圾内容检测模块 ---
+
+/**
+ * 加载/解析垃圾关键词列表
+ * @param {object} env - 环境变量
+ * @returns {string[]} 关键词数组
+ */
+function getSpamKeywords(env) {
+    if (spamKeywordsCache) return spamKeywordsCache;
+
+    const raw = (env.SPAM_KEYWORDS || '').toString().trim();
+    if (!raw) {
+        spamKeywordsCache = [];
+        return spamKeywordsCache;
+    }
+
+    spamKeywordsCache = raw.split(/[,;，；\n]+/g)
+        .map(s => s.trim().toLowerCase())
+        .filter(s => s.length > 0);
+
+    if (spamKeywordsCache.length > 0) {
+        Logger.info('spam_keywords_loaded', { count: spamKeywordsCache.length });
+    }
+    return spamKeywordsCache;
+}
+
+/**
+ * 检测消息文本中是否包含 URL/链接
+ * @param {string} text - 消息文本
+ * @returns {boolean}
+ */
+function containsLink(text) {
+    if (!text) return false;
+    const patterns = [
+        /https?:\/\/\S+/i,
+        /[a-zA-Z0-9][a-zA-Z0-9-]*\.[a-zA-Z]{2,}(\/\S*)?/,
+        /t\.me\/\S+/i,
+        /telegram\.me\/\S+/i,
+    ];
+    return patterns.some(p => p.test(text));
+}
+
+/**
+ * 检测消息是否包含垃圾关键词
+ * @param {string} text - 消息文本
+ * @param {string[]} keywords - 关键词列表
+ * @returns {{isSpam: boolean, matchedWord: string|null}}
+ */
+function detectSpamKeywords(text, keywords) {
+    if (!text || keywords.length === 0) {
+        return { isSpam: false, matchedWord: null };
+    }
+    const lower = text.toLowerCase();
+    for (const word of keywords) {
+        if (lower.includes(word)) {
+            return { isSpam: true, matchedWord: word };
+        }
+    }
+    return { isSpam: false, matchedWord: null };
+}
+
+/**
+ * 计算消息内容的简单哈希（用于重复检测）
+ * @param {object} msg - Telegram message object
+ * @returns {string|null} 哈希字符串，无法计算时返回 null
+ */
+function computeMessageHash(msg) {
+    const text = (msg.text || msg.caption || '').trim().toLowerCase();
+    if (!text) return null;
+
+    // 简单 SHA-like：用 text 长度 + 前100字符 + 后20字符 组成 fingerprint
+    const fingerprint = `${text.length}|${text.substring(0, 100)}|${text.substring(Math.max(0, text.length - 20))}`;
+    return fingerprint;
+}
+
+/**
+ * 检测用户是否在短时间内重复发送相同内容
+ * @param {number} userId - 用户 ID
+ * @param {object} msg - Telegram message object
+ * @returns {Promise<{isRepeat: boolean, count: number}>}
+ */
+async function detectRepeatMessage(userId, msg) {
+    const hash = computeMessageHash(msg);
+    if (!hash) return { isRepeat: false, count: 0 };
+
+    const cacheKey = `msghash:${userId}:${hash}`;
+    const cached = messageHashCache.get(cacheKey);
+    const count = (cached?.count || 0) + 1;
+
+    messageHashCache.set(cacheKey, { count, ts: Date.now() });
+
+    if (count >= CONFIG.SPAM_REPEAT_MESSAGE_LIMIT) {
+        return { isRepeat: true, count };
+    }
+    return { isRepeat: false, count };
+}
+
+/**
+ * 综合垃圾检测（关键词 + 链接 + 重复）
+ * @param {object} msg - Telegram message object
+ * @param {number} userId - 用户 ID
+ * @param {object} env - 环境变量
+ * @returns {Promise<{isSpam: boolean, reasons: string[], details: object}>}
+ */
+async function spamCheck(msg, userId, env) {
+    const reasons = [];
+    const details = {};
+    const text = (msg.text || msg.caption || '').trim();
+
+    // 1. 关键词检测
+    const keywords = getSpamKeywords(env);
+    const keywordResult = detectSpamKeywords(text, keywords);
+    if (keywordResult.isSpam) {
+        reasons.push('keyword');
+        details.keyword = keywordResult.matchedWord;
+    }
+
+    // 2. 链接检测（新用户限制）
+    if (containsLink(text)) {
+        // 检查用户验证时间：如果在 24 小时内验证的，拦截链接
+        const verifyTs = await env.TOPIC_MAP.get(`verified_ts:${userId}`);
+        if (verifyTs) {
+            const elapsed = (Date.now() - parseInt(verifyTs)) / 1000;
+            if (elapsed < CONFIG.NEW_USER_LINK_BLOCK_SECONDS) {
+                const remainingHours = Math.ceil((CONFIG.NEW_USER_LINK_BLOCK_SECONDS - elapsed) / 3600);
+                reasons.push('new_user_link');
+                details.linkBlockRemainingHours = remainingHours;
+            }
+        }
+    }
+
+    // 3. 重复消息检测
+    const repeatResult = await detectRepeatMessage(userId, msg);
+    if (repeatResult.isRepeat) {
+        reasons.push('repeat_message');
+        details.repeatCount = repeatResult.count;
+    }
+
+    return {
+        isSpam: reasons.length > 0,
+        reasons,
+        details
+    };
+}
+
+/**
+ * 处理垃圾消息（通知管理员或静默丢弃）
+ * @param {object} env - 环境变量
+ * @param {number} userId - 用户 ID
+ * @param {object} msg - 消息对象
+ * @param {object} spamResult - spamCheck 返回的结果
+ * @param {number} threadId - 可选，话题 ID
+ */
+async function handleSpamMessage(env, userId, msg, spamResult, threadId) {
+    Logger.warn('spam_detected', {
+        userId,
+        reasons: spamResult.reasons,
+        details: spamResult.details,
+        textPreview: (msg.text || msg.caption || '').substring(0, 100)
+    });
+
+    if (CONFIG.SPAM_NOTIFY_ADMIN && !CONFIG.SPAM_SILENCE_MODE) {
+        const reasonText = spamResult.reasons.map(r => {
+            switch (r) {
+                case 'keyword': return `🔑 关键词: \`${spamResult.details.keyword}\``;
+                case 'new_user_link': return `🔗 新用户链接 (剩余 ${spamResult.details.linkBlockRemainingHours}h)`;
+                case 'repeat_message': return `🔄 重复消息 (${spamResult.details.repeatCount}次)`;
+                default: return r;
+            }
+        }).join('\n');
+
+        const body = threadId ? { message_thread_id: threadId } : {};
+
+        await tgCall(env, 'sendMessage', {
+            chat_id: env.SUPERGROUP_ID,
+            text: `⚠️ **检测到疑似骚扰消息**\n\n👤 用户: \`${userId}\`\n${reasonText}\n\n📝 消息已拦截。使用 /ban 封禁该用户。`,
+            parse_mode: 'Markdown',
+            ...body
+        });
+    }
+}
+
+// --- Turnstile 验证页面 HTML 模板 ---
+// 由 Worker 的 GET /verify 端点渲染，用户点击 bot 按钮后跳转到此页面
+// 模板变量：{{SITE_KEY}} {{CODE}} {{USER_ID}} {{WORKER_URL}}
+const VERIFY_PAGE_HTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>人机验证</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
+.card{background:#fff;border-radius:16px;padding:32px 24px;max-width:400px;width:100%;text-align:center;box-shadow:0 2px 16px rgba(0,0,0,0.08)}
+.icon{font-size:48px;margin-bottom:12px}
+h2{color:#1a1a1a;margin-bottom:8px;font-size:20px}
+p.desc{color:#666;font-size:14px;margin-bottom:24px;line-height:1.6}
+.turnstile-container{display:flex;justify-content:center;margin-bottom:20px;min-height:65px}
+#status{font-size:13px;color:#999;margin-top:12px;min-height:20px}
+.success{color:#22c55e}
+.error{color:#ef4444}
+.footer{margin-top:20px;font-size:11px;color:#bbb}
+.footer span{font-family:monospace;color:#999}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">🛡️</div>
+  <h2>人机验证</h2>
+  <p class="desc">请完成下方验证以确认您不是机器人。<br>验证通过后您的消息将自动送达。</p>
+  <div class="turnstile-container">
+    <div class="cf-turnstile" data-sitekey="{{SITE_KEY}}" data-callback="onTurnstileSuccess" data-error-callback="onTurnstileError" data-theme="light"></div>
+  </div>
+  <div id="status">正在加载验证组件...</div>
+  <a id="back-btn" href="tg://resolve" style="display:none;margin-top:16px;background:#0088cc;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-size:16px;text-decoration:none;">📱 返回 Telegram</a>
+  <div class="footer">
+    User: <span>{{USER_ID}}</span> · Code: <span>{{CODE}}</span>
+  </div>
+</div>
+<script>
+var submitted = false;
+function showStatus(msg, cls) {
+  var el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = cls || '';
+}
+function onTurnstileSuccess(token) {
+  if (submitted) return;
+  submitted = true;
+  showStatus('✅ 验证通过！正在通知机器人...', 'success');
+  fetch('{{WORKER_URL}}/verify-callback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: token, code: '{{CODE}}', userId: '{{USER_ID}}' })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.success) {
+      var msg = '✅ 验证成功！机器人已收到您的消息。';
+      if (data.pendingCount > 0) {
+        msg += '（' + data.pendingCount + ' 条消息将于数秒内送达）';
+      }
+      showStatus(msg, 'success');
+      document.querySelector('.desc').textContent = '请返回 Telegram，机器人已向您发送了验证通过通知。';
+      // 显示返回 Telegram 按钮
+      var btn = document.getElementById('back-btn');
+      if (btn) {
+        btn.style.display = 'inline-block';
+      }
+    } else {
+      var errMap = {
+        'turnstile_failed': '人机验证未通过，请刷新页面重试',
+        'code_invalid_or_expired': '验证链接已过期（有效期10分钟），请返回 Telegram 重新发送消息获取新的验证链接',
+        'server_not_configured': '服务器未完成配置，请联系管理员'
+      };
+      var errMsg = errMap[data.error] || ('验证失败: ' + (data.detail || data.error || '未知错误'));
+      showStatus(errMsg, 'error');
+      submitted = false;
+      if (window.turnstile) {
+        window.turnstile.reset();
+      }
+    }
+  })
+  .catch(function(e) {
+    showStatus('❌ 网络连接失败，请检查网络后刷新页面重试', 'error');
+    submitted = false;
+    if (window.turnstile) {
+      window.turnstile.reset();
+    }
+  });
+}
+function onTurnstileError() {
+  showStatus('⚠️ 验证组件加载失败，请刷新页面重试', 'error');
+}
+</script>
+</body>
+</html>`;
+
 export default {
   async fetch(request, env, ctx) {
     // 环境自检
@@ -387,6 +718,174 @@ export default {
     // 验证 SUPERGROUP_ID 格式
     if (!normalizedEnv.SUPERGROUP_ID.startsWith("-100")) {
         return new Response("Error: SUPERGROUP_ID must start with -100");
+    }
+
+    const url = new URL(request.url);
+
+    // --- GET 请求处理 ---
+
+    if (request.method === "GET") {
+        // 健康检查
+        if (url.pathname === "/" || url.pathname === "/health") {
+            return new Response("OK");
+        }
+
+        // Turnstile 验证页面（用户点击 bot 按钮后跳转到的页面）
+        if (url.pathname === "/verify" || url.pathname.endsWith("/verify")) {
+            const code = url.searchParams.get('code');
+            const userId = url.searchParams.get('uid');
+            const siteKey = (env.TURNSTILE_SITE_KEY || '').toString().trim();
+
+            if (!code || !userId || !siteKey) {
+                return new Response(
+                    '<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><h2>❌ 参数无效</h2><p>缺少验证信息或系统未配置 Turnstile。</p></body></html>',
+                    { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+                );
+            }
+
+            const workerUrl = url.origin;
+
+            return new Response(VERIFY_PAGE_HTML
+                .replace(/{{SITE_KEY}}/g, siteKey)
+                .replace(/{{CODE}}/g, code)
+                .replace(/{{USER_ID}}/g, userId)
+                .replace(/{{WORKER_URL}}/g, workerUrl),
+                { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+            );
+        }
+
+        return new Response("Not Found", { status: 404 });
+    }
+
+    // --- POST 请求处理（Telegram webhook + Turnstile token 验证） ---
+
+    // Turnstile token 验证端点（由前端页面 JS fetch 调用）
+    if ((url.pathname === "/verify-callback" || url.pathname.endsWith("/verify-callback")) && request.method === "POST") {
+        try {
+            const body = await request.json();
+            const { token, code, userId } = body || {};
+
+            if (!token || !code || !userId) {
+                return new Response(JSON.stringify({ success: false, error: 'missing_params' }), {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+
+            // 验证 Turnstile token
+            const turnstileSecret = (env.TURNSTILE_SECRET_KEY || '').toString().trim();
+            if (!turnstileSecret) {
+                return new Response(JSON.stringify({ success: false, error: 'server_not_configured' }), {
+                    status: 500,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+
+            const verifyResult = await verifyTurnstileToken(token, turnstileSecret);
+            if (!verifyResult.success) {
+                Logger.warn('turnstile_token_invalid', { userId, error: verifyResult.error });
+                return new Response(JSON.stringify({ success: false, error: 'turnstile_failed', detail: verifyResult.error }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+
+            // 从 KV 验证 code 是否匹配
+            const storedUserId = await env.TOPIC_MAP.get(`turnstile_code:${code}`);
+            if (!storedUserId || storedUserId !== String(userId)) {
+                return new Response(JSON.stringify({ success: false, error: 'code_invalid_or_expired' }), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+
+            // Turnstile token 有效 + code 匹配 → 标记验证通过
+            await env.TOPIC_MAP.put(`verified:${userId}`, "1", { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
+            await env.TOPIC_MAP.put(`verified_ts:${userId}`, String(Date.now()), { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
+            await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
+            await env.TOPIC_MAP.delete(`turnstile_code:${code}`);
+            await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
+
+            Logger.info('turnstile_verification_success', { userId });
+
+            // 删除验证消息（去掉带按钮的验证卡片）
+            const verifyMsgId = await env.TOPIC_MAP.get(`turnstile_msg:${code}`);
+            ctx.waitUntil((async () => {
+                if (verifyMsgId) {
+                    try {
+                        await tgCall(normalizedEnv, "deleteMessage", {
+                            chat_id: Number(userId),
+                            message_id: parseInt(verifyMsgId)
+                        });
+                    } catch (e) {
+                        // 消息可能已被删除，忽略
+                    }
+                    await env.TOPIC_MAP.delete(`turnstile_msg:${code}`);
+                }
+                await tgCall(normalizedEnv, "sendMessage", {
+                    chat_id: Number(userId),
+                    text: "✦ 验证通过\n\n有什么可以帮你的？直接发消息就好。",
+                    parse_mode: "Markdown"
+                });
+            })());
+
+            // 返回 pending 消息列表供前端页面显示，由 worker 在后台转发
+            const pendingKey = `pending_turnstile:${userId}`;
+            const pendingIdsStr = await env.TOPIC_MAP.get(pendingKey);
+            let pendingCount = 0;
+            if (pendingIdsStr) {
+                try {
+                    const pendingIds = JSON.parse(pendingIdsStr);
+                    if (Array.isArray(pendingIds) && pendingIds.length > 0) {
+                        pendingCount = Math.min(pendingIds.length, CONFIG.PENDING_MAX_MESSAGES);
+                        ctx.waitUntil((async () => {
+                            let forwardedCount = 0;
+                            const limited = pendingIds.slice(0, CONFIG.PENDING_MAX_MESSAGES);
+                            for (const pendingId of limited) {
+                                if (!pendingId) continue;
+                                const fakeMsg = {
+                                    message_id: pendingId,
+                                    chat: { id: Number(userId), type: "private" },
+                                    from: { id: Number(userId) },
+                                };
+                                try {
+                                    await forwardToTopic(fakeMsg, userId, `user:${userId}`, normalizedEnv, ctx);
+                                    forwardedCount++;
+                                } catch (e) {
+                                    Logger.error('pending_turnstile_forward_failed', e, { userId, messageId: pendingId });
+                                }
+                            }
+                            if (forwardedCount > 0) {
+                                await tgCall(normalizedEnv, "sendMessage", {
+                                    chat_id: Number(userId),
+                                    text: `📩 您的 ${forwardedCount} 条消息已送达。`
+                                });
+                            }
+                        })());
+                    }
+                } catch (e) {
+                    Logger.error('pending_turnstile_parse_failed', e, { userId });
+                }
+                await env.TOPIC_MAP.delete(pendingKey);
+            }
+
+            return new Response(JSON.stringify({ success: true, pendingCount }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        } catch (e) {
+            Logger.error('verify_callback_error', e);
+            return new Response(JSON.stringify({ success: false, error: 'internal_error' }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+    }
+
+    // 仅处理 Telegram webhook POST 请求（Content-Type: application/json）
+    if (request.method === "POST" && (url.pathname === "/verify-callback" || url.pathname.endsWith("/verify-callback"))) {
+        // 已在上面处理，这里不应该到达，但作为兜底
+        return new Response("OK");
     }
 
     if (request.method !== "POST") return new Response("OK");
@@ -474,8 +973,19 @@ async function handlePrivateMessage(msg, env, ctx) {
       return;
   }
 
-  // 拦截普通用户发送的指令
+  // 拦截普通用户发送的指令（Turnstile 验证指令除外）
   if (msg.text && msg.text.startsWith("/") && msg.text.trim() !== "/start") {
+      const text = msg.text.trim();
+      // 允许用户在完成 Turnstile 后发送验证确认
+      if (text.startsWith("/verify")) {
+          // 已废弃：Turnstile 验证完全在页面内完成，无需此命令
+          // 保留处理以兼容旧模板
+          await tgCall(env, "sendMessage", {
+              chat_id: userId,
+              text: "✅ 验证已自动完成。如果您已完成网页验证，请直接发送消息即可。"
+          });
+          return;
+      }
       return;
   }
 
@@ -491,10 +1001,33 @@ async function handlePrivateMessage(msg, env, ctx) {
     return;
   }
 
+  // 【新增】已验证用户的消息垃圾检测
+  const spamResult = await spamCheck(msg, userId, env);
+  if (spamResult.isSpam) {
+      // 查找用户的话题 ID（如果有的话）
+      let threadId = null;
+      try {
+          const userRec = await safeGetJSON(env, key, null);
+          if (userRec && userRec.thread_id) {
+              threadId = userRec.thread_id;
+          }
+      } catch (e) { /* ignore */ }
+      await handleSpamMessage(env, userId, msg, spamResult, threadId);
+      // 不转发有问题的消息，但也不告诉用户（避免对方知道被检测）
+      return;
+  }
+
   await forwardToTopic(msg, userId, key, env, ctx);
 }
 
 async function forwardToTopic(msg, userId, key, env, ctx) {
+    // 【新增】转发前垃圾检测（双保险，验证状态可能过期或其他并发场景）
+    const spamResult = await spamCheck(msg, userId, env);
+    if (spamResult.isSpam) {
+        await handleSpamMessage(env, userId, msg, spamResult, null /* threadId 在 handleSpamMessage 中不需要 */ );
+        return; // 拦截消息, 静默丢弃
+    }
+
     // 并发兜底：如果已被标记为需要重新验证，直接发起验证并暂停转发/建话题
     const needsVerify = await env.TOPIC_MAP.get(`needs_verify:${userId}`);
     if (needsVerify) {
@@ -794,8 +1327,28 @@ async function handleAdminReply(msg, env, ctx) {
       const verifyStatus = await env.TOPIC_MAP.get(`verified:${userId}`);
       const banStatus = await env.TOPIC_MAP.get(`banned:${userId}`);
 
-      const info = `👤 **用户信息**\nUID: \`${userId}\`\nTopic ID: \`${threadId}\`\n话题标题: ${userRec?.title || "未知"}\n验证状态: ${verifyStatus ? (verifyStatus === 'trusted' ? '🌟 永久信任' : '✅ 已验证') : '❌ 未验证'}\n封禁状态: ${banStatus ? '🚫 已封禁' : '✅ 正常'}\nLink: [点击私聊](tg://user?id=${userId})`;
-      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: info, parse_mode: "Markdown" });
+      const info = `👤 **用户信息**\nUID: \`${userId}\`\nTopic ID: \`${threadId}\`\n话题标题: ${userRec?.title || "未知"}\n验证状态: ${verifyStatus ? (verifyStatus === 'trusted' ? '🌟 永久信任' : '✅ 已验证') : '❌ 未验证'}\n封禁状态: ${banStatus ? '🚫 已封禁' : '✅ 正常'}\n[点击私聊](tg://user?id=${userId}) _(手机端)_`;
+      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: info, parse_mode: "Markdown", link_preview_options: { is_disabled: true } });
+      return;
+  }
+
+  if (text === "/help") {
+      const helpText = `📋 **指令列表**
+
+🛠️ **对话管理**
+\`/close\` · 关闭对话并拒收消息
+\`/open\` · 重新开启对话
+
+👤 **用户管理**
+\`/ban\` · 封禁用户
+\`/unban\` · 解封用户
+\`/trust\` · 永久信任（免验证）
+\`/reset\` · 重置验证状态
+
+📊 **工具**
+\`/info\` · 查看当前用户信息
+\`/cleanup\` · 扫描清理失效数据`;
+      await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, message_thread_id: threadId, text: helpText, parse_mode: "Markdown" });
       return;
   }
 
@@ -854,6 +1407,59 @@ async function sendVerificationChallenge(userId, env, pendingMsgId) {
         return;
     }
 
+    // 【新增】Turnstile 模式：如果配置了 TURNSTILE_SITE_KEY 和 VERIFICATION_PAGE_URL，优先使用 Turnstile
+    const turnstileSiteKey = (env.TURNSTILE_SITE_KEY || '').toString().trim();
+    const verificationPageUrl = (env.VERIFICATION_PAGE_URL || '').toString().trim();
+
+    if (turnstileSiteKey && verificationPageUrl) {
+        // --- Turnstile 模式 ---
+        const verifyCode = generateVerifyCode();
+        // 存储 pending 消息（用于 Turnstile 验证通过后转发）
+        if (pendingMsgId) {
+            const pendingKey = `pending_turnstile:${userId}`;
+            const existingPending = await env.TOPIC_MAP.get(pendingKey);
+            let pendingIds = [];
+            if (existingPending) {
+                try { pendingIds = JSON.parse(existingPending); } catch (e) { /* ignore */ }
+            }
+            if (!pendingIds.includes(pendingMsgId)) {
+                pendingIds.push(pendingMsgId);
+                if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) {
+                    pendingIds = pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES);
+                }
+            }
+            await env.TOPIC_MAP.put(pendingKey, JSON.stringify(pendingIds), { expirationTtl: CONFIG.TURNSTILE_VERIFY_TTL });
+        }
+
+        // 将验证 code 和 userId 绑定存储
+        await env.TOPIC_MAP.put(`turnstile_code:${verifyCode}`, String(userId), { expirationTtl: CONFIG.TURNSTILE_VERIFY_TTL });
+        await env.TOPIC_MAP.put(`user_challenge:${userId}`, verifyCode, { expirationTtl: CONFIG.TURNSTILE_VERIFY_TTL });
+
+        // 构造验证页面 URL（Worker 自身提供 /verify 端点渲染 Turnstile 页面）
+        // verificationPageUrl 这里是 Worker 自身的 URL（例如 https://xxx.workers.dev）
+        const verifyPageUrl = `${verificationPageUrl.replace(/\/+$/, '')}/verify?code=${encodeURIComponent(verifyCode)}&uid=${encodeURIComponent(userId)}`;
+
+        Logger.info('turnstile_verification_sent', { userId, verifyCode });
+
+        const sentMsg = await tgCall(env, "sendMessage", {
+            chat_id: userId,
+            text: `🛡️ **人机验证**\n\n请点击下方按钮，在打开的页面中完成人机验证。\n\n验证通过后您的消息将自动送达，无需额外操作。\n\n⏰ 验证码有效期：10分钟`,
+            parse_mode: "Markdown",
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: "🔒 点击进行人机验证", url: verifyPageUrl }
+                ]]
+            }
+        });
+
+        // 保存验证消息 ID，用于验证通过后删除
+        if (sentMsg.ok && sentMsg.result && sentMsg.result.message_id) {
+            await env.TOPIC_MAP.put(`turnstile_msg:${verifyCode}`, String(sentMsg.result.message_id), { expirationTtl: CONFIG.TURNSTILE_VERIFY_TTL });
+        }
+        return;
+    }
+
+    // --- 本地题库模式（降级方案） ---
     // 【修复 #9】使用加密安全的随机数
     const q = LOCAL_QUESTIONS[secureRandomInt(0, LOCAL_QUESTIONS.length)];
     const challenge = {

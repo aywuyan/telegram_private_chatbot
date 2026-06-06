@@ -1,4 +1,4 @@
-# 🛡️ TeleGuard (v4.0)
+# 🛡️ TeleGuard (v5.4)
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jikssha/telegram_private_chatbot)
 ![GitHub stars](https://img.shields.io/github/stars/jikssha/telegram_private_chatbot?style=social)
@@ -7,11 +7,39 @@
 
 [🇺🇸 English](README_EN.md) | [🇨🇳 简体中文](README.md)
 
-**Telegram Private Chatbot** is a high-performance, two-way private messaging bot based on **Cloudflare Workers**. It is designed to solve the problem of spam harassment on Telegram, featuring a zero-latency local CAPTCHA verification system, a powerful set of administrator commands, and a seamless message forwarding experience.
+**Telegram Private Chatbot** is a high-performance, two-way private messaging bot based on **Cloudflare Workers**. It is designed to solve the problem of spam harassment on Telegram, featuring Cloudflare Turnstile CAPTCHA verification, intelligent content filtering, a powerful set of administrator commands, and a seamless message forwarding experience.
 
 Deploy a free, enterprise-grade customer service system utilizing Cloudflare's powerful edge computing network without purchasing any servers.
 
 ---
+
+<details>
+<summary>📢 <b>v5.4 Major Update (2026-06-06)</b></summary>
+
+### New Features:
+- **☁️ Cloudflare Turnstile CAPTCHA**: Click-to-verify CAPTCHA powered by Cloudflare Turnstile. Much harder to bypass than traditional quizzes. Completely free (1M verifications/month). Enable by setting `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, and `VERIFICATION_PAGE_URL` environment variables.
+- **🔍 Intelligent Spam Filtering**: Keyword detection (`SPAM_KEYWORDS` env var), link blocking for new users (24h cooldown), and repeated message circuit breaker (auto-block after 3 identical messages).
+- **🛡️ Spam Notifications**: Automatically notifies the admin group when spam is detected. Supports silent mode (`SPAM_SILENCE_MODE`).
+- **📄 Built-in Verification Page**: The Turnstile verification page is embedded directly in the Worker — no additional Pages deployment needed.
+- **📋 `/help` Command**: Type `/help` in any topic to see all admin commands — no need to browse documentation.
+
+### Improvements:
+- Graceful fallback to local quiz verification when Turnstile is not configured
+- Dual spam checks in both `handlePrivateMessage` and `forwardToTopic` prevents bypass via race conditions
+- Verification message auto-deleted after successful Turnstile verification
+- Verification success message redesigned with clean, minimal styling
+- `/info` now includes a clickable direct chat link (mobile)
+- `/cleanup` can be executed from any topic, not just user topics
+
+### ⚠️ Upgrade Guide:
+Fork users: click "Sync fork" to auto-update.
+Manual deploy users: copy the updated `worker.js`, redeploy, and add the new environment variables.
+</details>
+
+---
+
+<details>
+<summary>📢 <b>v5.1 Update (2026-01-05)</b></summary>
 
 ## 📑 Table of Contents
 
@@ -32,8 +60,8 @@ Version 4.0 removes all unstable external API dependencies, focusing on **extrem
 
 | Feature | Description |
 | :--- | :--- |
-| **⚡ Zero-Latency Verification** | Uses a **local curated trivia database**. Verifies instantly, completely eliminating network timeouts and API errors with a 100% success rate. |
-| **🛡️ Smart Anti-Spam** | **Short ID mechanism** fixes the Telegram button click failure bug. Provides a **30-day disturbance-free period** after verification, balancing security and user experience. |
+| **⚡ Zero-Latency Verification** | Uses a **local curated trivia database**. Verifies instantly, completely eliminating network timeouts and API errors with a 100% success rate. **v5.4 adds optional Turnstile click verification** for stronger bot protection. |
+| **🛡️ Smart Anti-Spam** | **Short ID mechanism** fixes the Telegram button click failure bug. Provides a **30-day disturbance-free period** after verification, balancing security and user experience. **v5.4 adds keyword filtering, link blocking, and repeat message detection**. |
 | **💬 Topic Group Management** | Utilizes **Telegram Forum Topics** to automatically create a separate topic for each private chat user, isolating messages for organized management. |
 | **👮 Invisible Command System** | Automatically **intercepts** commands starting with `/` sent by users to prevent harassment. Admin commands are only effective within the administrator group. |
 | **🔒 Permission Control** | Powerful command set: Supports **Ban (/ban)**, **Unban (/unban)**, **Close Ticket (/close)**, and **Trust (/trust)** operations. |
@@ -54,7 +82,51 @@ Version 4.0 removes all unstable external API dependencies, focusing on **extrem
 | `/unban` | **Unban User**<br>Restores the user's normal communication permissions. | Giving a second chance. |
 | `/trust` | **Permanent Trust**<br>The user will be permanently exempt from CAPTCHA verification (never expires). | Acquaintances, VIP clients, long-term partners. |
 | `/reset` | **Reset Verification**<br>Forcibly clears the user's verification status; re-verification required next time. | Testing verification flow, or suspected account compromise. |
-| `/info` | **View Info**<br>Displays the current user's UID, Topic ID, and profile link. | Checking user details. |
+| `/info` | **View Info**<br>Displays the current user's UID, Topic ID, and verification status. | Checking user details. |
+| `/help` | **Help**<br>Shows all available admin commands. | Quick command reference. |
+| `/cleanup` | **Batch Cleanup**<br>Scans and cleans up data for deleted topics. | Removing stale users. |
+
+---
+
+## 🛡️ Anti-Spam System (New in v5.4)
+
+### Cloudflare Turnstile CAPTCHA
+
+> **Recommended**: Turnstile is Cloudflare's free CAPTCHA alternative. Users simply click a checkbox to verify — impossible for automated scripts to bypass.
+
+**How to enable**:
+1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Turnstile** → **Add Site**
+2. Create a Turnstile Widget and get the `Site Key` (public) and `Secret Key` (private)
+3. Add these environment variables in Worker **Settings** → **Variables**:
+
+| Variable | Value |
+|----------|-------|
+| `TURNSTILE_SITE_KEY` | Your Turnstile Site Key |
+| `TURNSTILE_SECRET_KEY` | Your Turnstile Secret Key |
+| `VERIFICATION_PAGE_URL` | Your Worker's full URL (e.g. `https://xxx.workers.dev`) |
+
+> 💡 **Free tier**: Turnstile provides **1 million** free verifications per month.
+
+> 💡 **Graceful fallback**: If Turnstile variables are not configured, the bot automatically falls back to local quiz verification.
+
+### Spam Content Filtering
+
+Configure `SPAM_KEYWORDS` environment variable with ad/spam keywords separated by **commas, semicolons, or line breaks**.
+
+**Example**:
+```
+SPAM_KEYWORDS = crypto,free money,click here,join now,make money,earn daily,limited offer,DM me,paid consultation
+```
+
+The system performs **three-layer detection** on verified users' messages:
+1. **Keyword matching** — Messages containing any `SPAM_KEYWORDS` are blocked immediately
+2. **Link blocking** — Newly verified users (<24h) are blocked from sending URLs
+3. **Repeat message circuit breaker** — Same content repeated 3+ times in a short period triggers auto-block
+
+**Blocking behavior**:
+- Blocked messages are **NOT forwarded** to the group (admins won't be disturbed by spam)
+- A **notification is sent** to the admin group (with user ID + reason) for admin action (/ban)
+- Optionally enable `SPAM_SILENCE_MODE=true` for fully silent processing
 
 ---
 
@@ -90,6 +162,9 @@ This is the simplest automated deployment method. Cloudflare will automatically 
     * **Add Environment Variables**:
         * `BOT_TOKEN`: Your bot token.
         * `SUPERGROUP_ID`: Your group ID (e.g., -100123...).
+    * **(Recommended) Add Anti-Spam Variables** (see [Anti-Spam System](#-anti-spam-system-new-in-v54)):
+        * `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, `VERIFICATION_PAGE_URL` (for Turnstile)
+        * `SPAM_KEYWORDS`: Ad keywords (for content filtering)
 8.  **Final Step**: After configuration, go to the **Deployments** tab at the top, find the latest deployment record, and click **Retry deployment** on the right to apply variables.
 
 ### Method 2: Manual Deployment (Simple & Direct)
@@ -131,19 +206,23 @@ A: Please check if the Webhook is set correctly. You must ensure Telegram is all
 **Q: Why can't the bot create topics in the group?**
 A: Please ensure: 1. Group ID is correct (starts with -100); 2. Topics are enabled in the group; 3. The bot is an administrator and has "Manage Topics" permission.
 
+**Q: How do I enable Cloudflare Turnstile CAPTCHA?**
+A: Go to Cloudflare Dashboard → Turnstile → create a site → get Site Key and Secret Key → set `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, and `VERIFICATION_PAGE_URL` (your Worker's URL) as environment variables. See [Anti-Spam System](#-anti-spam-system-new-in-v54) for details.
+
+**Q: Can Turnstile and local quiz be used together?**
+A: If Turnstile variables are configured, the bot uses Turnstile by default. If not configured, it automatically falls back to local quiz verification. Both don't need to run simultaneously.
+
+**Q: Why are some messages being blocked as spam?**
+A: The system uses three-layer detection: 1) Keyword matching (via `SPAM_KEYWORDS` env var); 2) Link blocking for new users (24h period); 3) Repeat message circuit breaker (3+ identical messages). Blocked messages are not forwarded. Use `/trust` to whitelist legitimate users.
+
 ---
 
 ## 🔒 Security Note
 
 > [!IMPORTANT]
-> Please keep your Bot API Token and Secret Token safe, as this information is critical to the security of your service.
-
-> [!WARNING]
-> Do not change the configured Secret Token arbitrarily! After changing it, all registered bots will fail to work because they cannot match the original token. If you need to change it, all bots must be re-registered.
-
-- Choose a secure and memorable Secret Token during initial setup.
-- Avoid using simple or common prefixes.
-- Do not share sensitive information with others.
+> Please keep your Bot API Token, Turnstile Secret Key, and other sensitive information safe. Do not share them with others or expose them in public repositories.
+> 
+> The `TURNSTILE_SITE_KEY` is the only anti-spam variable safe to make public (it's used in the frontend HTML page). `TURNSTILE_SECRET_KEY` must remain private.
 
 ---
 
