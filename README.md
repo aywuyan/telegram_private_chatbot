@@ -1,7 +1,7 @@
 # 🤖 Telegram Private Chatbot (v5.4) 
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jikssha/telegram_private_chatbot)
-![GitHub stars](https://img.shields.io/github/stars/jikssha/telegram_private_chatbot?style=social)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/dydydd/telegram_private_chatbot)
+![GitHub stars](https://img.shields.io/github/stars/dydydd/telegram_private_chatbot?style=social)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 [![Telegram](https://img.shields.io/badge/Telegram-DM-blue?style=social&logo=telegram)](https://t.me/vaghr_wegram_bot)
 [🇺🇸 English](README_EN.md) | [🇨🇳 简体中文](README.md)
@@ -262,7 +262,7 @@ A: 如果你设置了自定义域名不成功，Webhook 改回 workers.dev 域�
 
 ## 📈 Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=jikssha/telegram_private_chatbot&type=date&legend=top-left)](https://www.star-history.com/#jikssha/telegram_private_chatbot&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=dydydd/telegram_private_chatbot&type=date&legend=top-left)](https://www.star-history.com/#dydydd/telegram_private_chatbot&type=date&legend=top-left)
 
 ---
 **如果这个项目对你有帮助，请给个 Star ⭐️ 吧！**

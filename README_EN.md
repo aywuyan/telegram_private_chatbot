@@ -1,7 +1,7 @@
 # 🛡️ TeleGuard (v5.4)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jikssha/telegram_private_chatbot)
-![GitHub stars](https://img.shields.io/github/stars/jikssha/telegram_private_chatbot?style=social)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/dydydd/telegram_private_chatbot)
+![GitHub stars](https://img.shields.io/github/stars/dydydd/telegram_private_chatbot?style=social)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 [![Telegram](https://img.shields.io/badge/Telegram-DM-blue?style=social&logo=telegram)](https://t.me/vaghr_wegram_bot)
 
@@ -228,7 +228,7 @@ A: The system uses three-layer detection: 1) Keyword matching (via `SPAM_KEYWORD
 
 ## 📈 Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=jikssha/telegram_private_chatbot&type=Date)](https://star-history.com/#jikssha/telegram_private_chatbot&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=dydydd/telegram_private_chatbot&type=Date)](https://star-history.com/#dydydd/telegram_private_chatbot&Date)
 
 ---
 **If this project helps you, please give it a Star ⭐️!**
