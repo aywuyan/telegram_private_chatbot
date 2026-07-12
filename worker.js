@@ -843,10 +843,26 @@ export default {
                             const limited = pendingIds.slice(0, CONFIG.PENDING_MAX_MESSAGES);
                             for (const pendingId of limited) {
                                 if (!pendingId) continue;
+                                // 获取用户信息用于正确的话题名
+                                let fromInfo = { id: Number(userId) };
+                                try {
+                                    const chatInfo = await tgCall(normalizedEnv, "getChat", { chat_id: Number(userId) });
+                                    if (chatInfo.ok && chatInfo.result) {
+                                        const u = chatInfo.result;
+                                        fromInfo = {
+                                            id: Number(userId),
+                                            first_name: u.first_name || u.title || "",
+                                            last_name: u.last_name || "",
+                                            username: u.username || ""
+                                        };
+                                    }
+                                } catch (e) {
+                                    Logger.warn('get_chat_info_failed', { userId });
+                                }
                                 const fakeMsg = {
                                     message_id: pendingId,
                                     chat: { id: Number(userId), type: "private" },
-                                    from: { id: Number(userId) },
+                                    from: fromInfo,
                                 };
                                 try {
                                     await forwardToTopic(fakeMsg, userId, `user:${userId}`, normalizedEnv, ctx);
@@ -983,6 +999,24 @@ async function handlePrivateMessage(msg, env, ctx) {
           await tgCall(env, "sendMessage", {
               chat_id: userId,
               text: "✅ 验证已自动完成。如果您已完成网页验证，请直接发送消息即可。"
+          });
+          return;
+      }
+      // 允许用户在私聊中使用 /help
+      if (text === "/help") {
+          const helpText = `📋 **指令说明**
+
+🤖 我是群组的双向聊天机器人。
+
+\`/start\` · 开始对话
+\`/help\` · 显示此帮助
+
+💡 首次使用请先完成人机验证。
+📩 直接发送消息即可与群组管理员对话。`;
+          await tgCall(env, "sendMessage", {
+              chat_id: userId,
+              text: helpText,
+              parse_mode: "Markdown"
           });
           return;
       }
